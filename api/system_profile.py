@@ -10,6 +10,7 @@ from api import flask_json_response
 from api import metrics
 from api.filtering.filtering import query_filters
 from api.host_query_db import get_os_info as get_os_info_db
+from api.host_query_db import get_sap_sids_info as get_sap_sids_info_db
 from api.host_query_db import get_sap_system_info as get_sap_system_info_db
 from app import RbacPermission
 from app import RbacResourceType
@@ -36,12 +37,14 @@ logger = get_logger(__name__)
 
 SAP_SYSTEM_QUERY = """
     query hostSystemProfile (
-        $hostFilter: HostFilter
+        $hostFilter: [HostFilter!],
         $limit: Int
         $offset: Int
     ) {
         hostSystemProfile (
-            hostFilter: $hostFilter
+            hostFilter: {
+                AND: $hostFilter,
+            },
         ) {
             sap_system (
                 limit: $limit
@@ -62,13 +65,15 @@ SAP_SYSTEM_QUERY = """
 
 SAP_SIDS_QUERY = """
     query hostSystemProfile (
-        $hostFilter: HostFilter
+        $hostFilter: [HostFilter!],
         $filter: SapSidFilter
         $limit: Int
         $offset: Int
     ) {
         hostSystemProfile (
-            hostFilter: $hostFilter
+            hostFilter: {
+                AND: $hostFilter,
+            },
         ) {
             sap_sids (
                 filter: $filter
@@ -140,18 +145,17 @@ def get_sap_system(
         return flask_json_response(build_collection_response(results, page, per_page, total))
 
     variables = {
-        "hostFilter": {
-            # we're not indexing null timestamps in ES
-            "OR": list(staleness_filter(staleness))
-        },
+        "hostFilter": {},
         "limit": limit,
         "offset": offset,
     }
 
-    hostfilter_and_variables = query_filters(tags=tags, registered_with=registered_with, filter=filter)
+    hostfilter_and_variables = query_filters(
+        tags=tags, registered_with=registered_with, filter=filter, staleness=staleness
+    )
 
     if hostfilter_and_variables != ():
-        variables["hostFilter"]["AND"] = hostfilter_and_variables
+        variables["hostFilter"] = hostfilter_and_variables
 
     response = graphql_query(SAP_SYSTEM_QUERY, variables, log_get_sap_system_failed)
 
@@ -179,28 +183,39 @@ def get_sap_sids(
     rbac_filter=None,
 ):
     limit, offset = pagination_params(page, per_page)
+    current_identity = get_current_identity()
+    escaped_search = None
+    if search:
+        # Escaped so that the string literals are not interpreted as regex
+        escaped_search = f".*{custom_escape(search)}.*"
+    if get_flag_value(FLAG_INVENTORY_DISABLE_XJOIN, context={"schema": current_identity.org_id}):
+        results, total = get_sap_sids_info_db(
+            limit,
+            offset,
+            staleness=staleness,
+            tags=tags,
+            registered_with=registered_with,
+            filter=filter,
+            rbac_filter=rbac_filter,
+            search=escaped_search,
+        )
+        return flask_json_response(build_collection_response(results, page, per_page, total))
 
     variables = {
-        "hostFilter": {
-            # we're not indexing null timestamps in ES
-            "OR": list(staleness_filter(staleness))
-        },
+        "hostFilter": {},
         "limit": limit,
         "offset": offset,
     }
 
-    if search:
-        variables["filter"] = {
-            # Escaped so that the string literals are not interpreted as regex
-            "search": {"regex": f".*{custom_escape(search)}.*"}
-        }
+    if escaped_search:
+        variables["filter"] = {"search": {"regex": escaped_search}}
 
     hostfilter_and_variables = query_filters(
-        tags=tags, registered_with=registered_with, filter=filter, rbac_filter=rbac_filter
+        tags=tags, registered_with=registered_with, filter=filter, rbac_filter=rbac_filter, staleness=staleness
     )
 
     if hostfilter_and_variables != ():
-        variables["hostFilter"]["AND"] = hostfilter_and_variables
+        variables["hostFilter"] = hostfilter_and_variables
 
     response = graphql_query(SAP_SIDS_QUERY, variables, log_get_sap_sids_failed)
 

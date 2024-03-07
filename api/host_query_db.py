@@ -3,6 +3,7 @@ from typing import Tuple
 
 from sqlalchemy import Boolean
 from sqlalchemy import func
+from sqlalchemy import text
 from sqlalchemy.orm import Query
 from sqlalchemy.sql.expression import ColumnElement
 
@@ -41,13 +42,15 @@ def get_all_hosts() -> List:
 def _get_host_list_using_filters(
     all_filters: List, page: int, per_page: int, param_order_by: str, param_order_how: str, fields: List[str]
 ) -> Tuple[List[Host], int, Tuple[str], List[str]]:
+    system_profile_fields = ["host_type"]
+    if fields and fields.get("system_profile"):
+        additional_fields = ("system_profile",)
+        system_profile_fields += list(fields.get("system_profile").keys())
+    else:
+        additional_fields = tuple()
+
     host_query = _find_all_hosts().filter(*all_filters).order_by(*params_to_order_by(param_order_by, param_order_how))
-
     query_results = host_query.paginate(page, per_page, True)
-
-    # TODO: additional_fields and system_profile_fields
-    additional_fields = tuple()
-    system_profile_fields = tuple()
 
     return query_results.items, query_results.total, additional_fields, system_profile_fields
 
@@ -192,7 +195,123 @@ def _expand_host_tags(hosts: List[Host]) -> dict:
     return host_tags_dict
 
 
-def get_os_info(limit, offset, staleness, tags, registered_with, filter, rbac_filter):
+def params_to_order_by_for_tags(order_by: str = None, order_how: str = None) -> str:
+    if order_by not in ["tag", "count"]:
+        raise ValueError('Unsupported ordering column: use "tag" or "count".')
+    elif order_how and order_by not in ["tag", "count"]:
+        raise ValueError(
+            "Providing ordering direction without a column is not supported. Provide order_by={tag,count}."
+        )
+    order_dir = "ASC"
+    if order_how.upper() == "DESC":
+        order_dir = "DESC"
+    if order_by == "tag":
+        ordering = f"namespace {order_dir}, key {order_dir}, value {order_dir}"
+    elif order_by == "count":
+        ordering = f"count {order_dir}"
+    return ordering
+
+
+def get_tag_list(
+    display_name: str,
+    fqdn: str,
+    hostname_or_id: str,
+    insights_id: str,
+    provider_id: str,
+    provider_type: str,
+    updated_start: str,
+    updated_end: str,
+    group_name: str,
+    tags: List[str],
+    limit: int,
+    offset: int,
+    order_by: str,
+    order_how: str,
+    search: str,
+    staleness: List[str],
+    registered_with: List[str],
+    filter: dict,
+    rbac_filter: dict,
+) -> Tuple[dict, int]:
+    ordering = params_to_order_by_for_tags(order_by=order_by, order_how=order_how)
+    columns = [
+        func.jsonb_object_keys(Host.tags).label("namespace"),
+    ]
+    query = _find_all_hosts(columns)
+    all_filters = query_filters(
+        fqdn,
+        display_name,
+        hostname_or_id,
+        insights_id,
+        provider_id,
+        provider_type,
+        updated_start,
+        updated_end,
+        group_name,
+        None,
+        tags,
+        staleness,
+        registered_with,
+        filter,
+        rbac_filter,
+    )
+
+    namespace_query = query.filter(*all_filters).distinct().subquery()
+    keys_query = (
+        db.session.query(
+            namespace_query.c.namespace.label("key_namespace"),
+            func.jsonb_object_keys(Host.tags[namespace_query.c.namespace]).label("key_key"),
+        )
+        .filter(*all_filters)
+        .distinct()
+        .subquery()
+    )
+
+    val_query = (
+        db.session.query(
+            keys_query.c.key_namespace.label("val_namespace"),
+            keys_query.c.key_key.label("val_key"),
+            func.jsonb_array_elements_text(Host.tags[keys_query.c.key_namespace][keys_query.c.key_key]).label(
+                "val_value"
+            ),
+        )
+        .filter(*all_filters)
+        .subquery()
+    )
+
+    query = (
+        db.session.query(
+            keys_query.c.key_namespace.label("namespace"),
+            keys_query.c.key_key.label("key"),
+            val_query.c.val_value.label("value"),
+            func.count().label("count"),
+        )
+        .filter(keys_query.c.key_namespace == val_query.c.val_namespace)
+        .filter(keys_query.c.key_key == val_query.c.val_key)
+    )
+    if search:
+        query = query.filter(text("val_namespace ~:reg OR val_key ~:reg OR val_value ~:reg")).params(reg=search)
+
+    query = query.group_by("namespace", "key", "value")
+    query_count = query.count()
+    query = query.order_by(text(f"{ordering}"))
+    query_results = query.offset(offset).limit(limit).all()
+    tag_list = []
+    for result in query_results:
+        tag = {"tag": {"namespace": result[0], "key": result[1], "value": result[2]}, "count": result[3]}
+        tag_list.append(tag)
+    return tag_list, query_count
+
+
+def get_os_info(
+    limit: int,
+    offset: int,
+    staleness: List[str],
+    tags: List[str],
+    registered_with: List[str],
+    filter: dict,
+    rbac_filter: dict,
+):
     columns = [
         Host.system_profile_facts["operating_system"]["name"].label("name"),
         Host.system_profile_facts["operating_system"]["major"].label("major"),
@@ -213,7 +332,15 @@ def get_os_info(limit, offset, staleness, tags, registered_with, filter, rbac_fi
     return result, query_total
 
 
-def get_sap_system_info(limit, offset, staleness, tags, registered_with, filter, rbac_filter):
+def get_sap_system_info(
+    limit: int,
+    offset: int,
+    staleness: List[str],
+    tags: List[str],
+    registered_with: List[str],
+    filter: dict,
+    rbac_filter: dict,
+):
     columns = [
         Host.system_profile_facts["sap_system"].label("value"),
     ]
@@ -233,3 +360,76 @@ def get_sap_system_info(limit, offset, staleness, tags, registered_with, filter,
     query_results = agg_query.offset(offset).limit(limit).all()
     result = [{"value": qr[0], "count": qr[1]} for qr in query_results]
     return result, query_total
+
+
+def get_sap_sids_info(
+    limit: int,
+    offset: int,
+    staleness: List[str],
+    tags: List[str],
+    registered_with: List[str],
+    filter: dict,
+    rbac_filter: dict,
+    search: str,
+):
+    columns = [
+        func.jsonb_array_elements_text(Host.system_profile_facts["sap_sids"]).label("sap_sids"),
+    ]
+    sap_sids_query = _find_all_hosts(columns)
+    filters = query_filters(
+        tags=tags, staleness=staleness, registered_with=registered_with, filter=filter, rbac_filter=rbac_filter
+    )
+    subquery = sap_sids_query.filter(*filters).subquery()
+
+    subquery_counts = (
+        db.session.query(subquery.c.sap_sids, func.count().label("count")).group_by(subquery.c.sap_sids).subquery()
+    )
+
+    if search:
+        agg_query = (
+            db.session.query(subquery_counts.c.sap_sids, subquery_counts.c.count)
+            .filter(text("sap_sids ~ :reg"))
+            .params(reg=search)
+            .order_by(subquery_counts.c.count.desc())
+        )
+    else:
+        agg_query = db.session.query(subquery_counts.c.sap_sids, subquery_counts.c.count).order_by(
+            subquery_counts.c.count.desc()
+        )
+
+    query_total = agg_query.count()
+    query_results = agg_query.offset(offset).limit(limit).all()
+    result = [{"value": qr[0], "count": qr[1]} for qr in query_results]
+    return result, query_total
+
+
+def get_sparse_system_profile(
+    host_id_list: List[str],
+    page: int,
+    per_page: int,
+    param_order_by: str,
+    param_order_how: str,
+    fields: List[str],
+    rbac_filter: dict,
+) -> Tuple[List[Host], int]:
+    columns = [
+        Host.id,
+        func.jsonb_strip_nulls(
+            func.jsonb_build_object(
+                *[
+                    kv
+                    for key in fields.get("system_profile")
+                    for kv in (key, Host.system_profile_facts[key].label(key))
+                ]
+            ).label("system_profile_facts")
+        ),
+    ]
+
+    all_filters = host_id_list_filter(host_id_list) + rbac_permissions_filter(rbac_filter)
+    sp_query = (
+        _find_all_hosts(columns).filter(*all_filters).order_by(*params_to_order_by(param_order_by, param_order_how))
+    )
+
+    query_results = sp_query.paginate(page, per_page, True)
+
+    return query_results.total, [{"id": str(item[0]), "system_profile": item[1]} for item in query_results.items]
